@@ -49,7 +49,12 @@ func New(ctx context.Context, dsn string, maxConns int32) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Store{pool: pool}, nil
+	st := &Store{pool: pool}
+	if err := st.EnsureSchema(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return st, nil
 }
 
 // Pool exposes the underlying pool for tests and ad-hoc queries.
@@ -57,6 +62,14 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
 // Close releases all pooled connections.
 func (s *Store) Close() { s.pool.Close() }
+
+// EnsureSchema guarantees required unique indexes exist on the database.
+func (s *Store) EnsureSchema(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id_unique ON events (event_id);
+	`)
+	return err
+}
 
 // EventExists reports whether an event with this ID has already been stored.
 func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
@@ -69,6 +82,61 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return true, nil
+}
+
+// IngestEventTx atomically inserts the event, upserts the call record, and
+// updates the account statistics inside a single PostgreSQL transaction.
+// If the event_id already exists, it rolls back / returns false without modifying
+// calls or account_stats (idempotent).
+func (s *Store) IngestEventTx(ctx context.Context, e Event) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	result, err := tx.Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
+		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		return false, err
+	}
+
+	if result.RowsAffected() == 0 {
+		return false, nil
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL)
+	if err != nil {
+		return false, err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID, e.DurationSec)
+	if err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+
 	return true, nil
 }
 

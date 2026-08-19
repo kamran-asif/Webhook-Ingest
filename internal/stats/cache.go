@@ -25,14 +25,31 @@ func NewCache() *Cache {
 
 // Get returns a snapshot of an account's totals. Unknown accounts read as zero.
 func (c *Cache) Get(accountID string) AccountStats {
+	st, _ := c.Lookup(accountID)
+	return st
+}
+
+// Lookup returns a snapshot of an account's totals and a boolean indicating if it was present.
+func (c *Cache) Lookup(accountID string) (AccountStats, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	s, ok := c.m[accountID]
 	if !ok {
-		return AccountStats{}
+		return AccountStats{}, false
 	}
-	return *s
+	return *s, true
+}
+
+// Set explicitly sets or updates an account's totals in the cache.
+func (c *Cache) Set(accountID string, st AccountStats) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.m[accountID] = &AccountStats{
+		CallCount:        st.CallCount,
+		TotalDurationSec: st.TotalDurationSec,
+	}
 }
 
 // Record folds one completed call into an account's running totals.

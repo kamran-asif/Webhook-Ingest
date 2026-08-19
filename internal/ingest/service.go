@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -22,6 +23,7 @@ type Service struct {
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+	wg    sync.WaitGroup
 }
 
 // New builds a Service.
@@ -29,12 +31,46 @@ func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *S
 	return &Service{store: s, cache: c, rdb: rdb, log: log}
 }
 
-// Stats returns the cached totals for an account.
-func (s *Service) Stats(accountID string) stats.AccountStats {
-	return s.cache.Get(accountID)
+// InitCache populates the in-memory cache with durable statistics from Postgres.
+func (s *Service) InitCache(ctx context.Context) error {
+	dbStats, err := s.store.AllAccountStats(ctx)
+	if err != nil {
+		return err
+	}
+	m := make(map[string]stats.AccountStats)
+	for acc, st := range dbStats {
+		m[acc] = stats.AccountStats{
+			CallCount:        st.CallCount,
+			TotalDurationSec: st.TotalDurationSec,
+		}
+	}
+	s.cache.LoadFromStats(m)
+	return nil
 }
 
-// Ingest stores a delivery and kicks off processing. Processing runs
+// Stats returns the cached totals for an account, falling back to PostgreSQL if missing.
+func (s *Service) Stats(accountID string) stats.AccountStats {
+	if st, found := s.cache.Lookup(accountID); found {
+		return st
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	dbStats, err := s.store.AccountStats(ctx, accountID)
+	if err != nil {
+		return stats.AccountStats{}
+	}
+
+	st := stats.AccountStats{
+		CallCount:        dbStats.CallCount,
+		TotalDurationSec: dbStats.TotalDurationSec,
+	}
+	s.cache.Set(accountID, st)
+	return st
+}
+
+// Ingest stores a delivery and kicks off processing atomically. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	payload, err := json.Marshal(evt)
@@ -53,8 +89,8 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		Payload:      payload,
 	}
 
-	// Atomic insert - returns false if event already exists (idempotent)
-	inserted, err := s.store.InsertEvent(ctx, rec)
+	// Atomic transaction: Insert event, upsert call, increment account stats atomically.
+	inserted, err := s.store.IngestEventTx(ctx, rec)
 	if err != nil {
 		return err
 	}
@@ -63,18 +99,13 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		return nil
 	}
 
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
-	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
-	// Use a background context to avoid cancellation during deployment.
 	if rec.RecordingURL != "" {
+		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
 			bgCtx := context.Background()
 			if err := s.processRecording(bgCtx, rec); err != nil {
 				s.log.Error("processRecording failed", "call_id", rec.CallID, "err", err)
@@ -83,6 +114,22 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	}
 
 	return nil
+}
+
+// Shutdown waits for all background tasks (e.g. recording processing) to complete.
+func (s *Service) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // processRecording downloads and transcodes the call recording, then marks
