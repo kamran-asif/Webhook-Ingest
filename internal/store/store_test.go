@@ -86,3 +86,50 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 		t.Fatal("expected recording_processed to be true")
 	}
 }
+
+func TestIngestEventTx_AtomicityAndIdempotency(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 120, Payload: []byte(`{}`),
+	}
+
+	// First ingestion succeeds
+	inserted, err := s.IngestEventTx(ctx, evt)
+	if err != nil {
+		t.Fatalf("IngestEventTx 1: %v", err)
+	}
+	if !inserted {
+		t.Fatal("expected first ingestion to return inserted=true")
+	}
+
+	// Verify stats count = 1
+	st, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats 1: %v", err)
+	}
+	if st.CallCount != 1 || st.TotalDurationSec != 120 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=120", st)
+	}
+
+	// Second ingestion with same event_id must be ignored
+	inserted2, err := s.IngestEventTx(ctx, evt)
+	if err != nil {
+		t.Fatalf("IngestEventTx 2: %v", err)
+	}
+	if inserted2 {
+		t.Fatal("expected duplicate ingestion to return inserted=false")
+	}
+
+	// Verify stats remain count = 1 (no double counting)
+	st2, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats 2: %v", err)
+	}
+	if st2.CallCount != 1 || st2.TotalDurationSec != 120 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=120 after duplicate", st2)
+	}
+}
