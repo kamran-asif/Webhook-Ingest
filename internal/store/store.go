@@ -63,7 +63,7 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Close releases all pooled connections.
 func (s *Store) Close() { s.pool.Close() }
 
-// EnsureSchema guarantees required unique indexes exist on the database.
+// EnsureSchema guarantees storage-tier B-Tree unique constraints exist on PostgreSQL.
 func (s *Store) EnsureSchema(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id_unique ON events (event_id);
@@ -71,7 +71,7 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	return err
 }
 
-// EventExists reports whether an event with this ID has already been stored.
+// EventExists reports whether an event with this ID has already been stored (Read-Only Check).
 func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	var one int
 	err := s.pool.QueryRow(ctx,
@@ -85,10 +85,10 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	return true, nil
 }
 
-// IngestEventTx atomically inserts the event, upserts the call record, and
-// updates the account statistics inside a single PostgreSQL transaction.
-// If the event_id already exists, it rolls back / returns false without modifying
-// calls or account_stats (idempotent).
+// IngestEventTx executes an atomic, single-transaction PostgreSQL operation (ACID Boundary).
+// It anchors idempotency via ON CONFLICT (event_id) DO NOTHING, upserts call entity state,
+// and increments per-account aggregates atomically. This guarantees Exact-Once Processing
+// Semantics (EOPS) and eliminates Time-of-Check to Time-of-Use (TOCTOU) race conditions.
 func (s *Store) IngestEventTx(ctx context.Context, e Event) (bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -96,6 +96,7 @@ func (s *Store) IngestEventTx(ctx context.Context, e Event) (bool, error) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Step 1: Atomic Idempotency Anchor Insertion
 	result, err := tx.Exec(ctx,
 		`INSERT INTO events (event_id, call_id, account_id, payload)
 		 VALUES ($1, $2, $3, $4)
@@ -105,10 +106,12 @@ func (s *Store) IngestEventTx(ctx context.Context, e Event) (bool, error) {
 		return false, err
 	}
 
+	// If 0 rows affected, duplicate delivery is detected -> Rollback & Return inserted = false
 	if result.RowsAffected() == 0 {
 		return false, nil
 	}
 
+	// Step 2: Call Entity State Synchronization (UPSERT)
 	_, err = tx.Exec(ctx,
 		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, now())
@@ -122,6 +125,7 @@ func (s *Store) IngestEventTx(ctx context.Context, e Event) (bool, error) {
 		return false, err
 	}
 
+	// Step 3: Atomic Per-Account Aggregate Mutation
 	_, err = tx.Exec(ctx,
 		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
 		 VALUES ($1, 1, $2)

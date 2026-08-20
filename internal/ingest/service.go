@@ -31,7 +31,8 @@ func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *S
 	return &Service{store: s, cache: c, rdb: rdb, log: log}
 }
 
-// InitCache populates the in-memory cache with durable statistics from Postgres.
+// InitCache executes Cache Hydration / Warming, loading durable account statistics
+// from PostgreSQL into volatile memory during application boot.
 func (s *Service) InitCache(ctx context.Context) error {
 	dbStats, err := s.store.AllAccountStats(ctx)
 	if err != nil {
@@ -48,7 +49,7 @@ func (s *Service) InitCache(ctx context.Context) error {
 	return nil
 }
 
-// Stats returns the cached totals for an account, falling back to PostgreSQL if missing.
+// Stats returns the cached totals for an account, falling back to PostgreSQL if missing (Cache Stampede Protection).
 func (s *Service) Stats(accountID string) stats.AccountStats {
 	if st, found := s.cache.Lookup(accountID); found {
 		return st
@@ -70,8 +71,8 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 	return st
 }
 
-// Ingest stores a delivery and kicks off processing atomically. Processing runs
-// asynchronously so the provider gets a fast acknowledgement.
+// Ingest processes an incoming payload delivery using Exact-Once Processing Semantics (EOPS).
+// It anchors idempotency via store.IngestEventTx and delegates background tasks safely.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	payload, err := json.Marshal(evt)
 	if err != nil {
@@ -95,13 +96,14 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		return err
 	}
 	if !inserted {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		s.log.Info("duplicate delivery ignored idempotently", "event_id", evt.EventID)
 		return nil
 	}
 
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
-	// Recordings are slow to fetch, so that part does not block the provider.
+	// Recordings are slow to fetch, so processing runs asynchronously without blocking HTTP ack.
+	// Uses sync.WaitGroup for Goroutine Lifecycle Tracking.
 	if rec.RecordingURL != "" {
 		s.wg.Add(1)
 		go func() {
@@ -116,7 +118,7 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	return nil
 }
 
-// Shutdown waits for all background tasks (e.g. recording processing) to complete.
+// Shutdown executes Graceful Worker Drain, waiting for all active background goroutines to finish before process exit.
 func (s *Service) Shutdown(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
