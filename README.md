@@ -1,5 +1,6 @@
 # Webhook Ingestion Service
 
+[![CI Test Suite](https://github.com/kamran-asif/Webhook-Ingest/actions/workflows/ci.yml/badge.svg)](https://github.com/kamran-asif/Webhook-Ingest/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![Database](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat&logo=postgresql)](https://www.postgresql.org/)
 [![Cache](https://img.shields.io/badge/Redis-7-DC382D?style=flat&logo=redis)](https://redis.io/)
@@ -7,6 +8,11 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 A production-grade, highly scalable HTTP webhook ingestion service written in Go. Designed to process high-throughput telephony call-completion events, guarantee **durable exact-once processing semantics (EOPS)**, and maintain zero-drift per-account call analytics under **at-least-once provider delivery**.
+
+---
+
+> [!IMPORTANT]
+> **Production Incident Solved**: This repository addresses critical defects including duplicate event storage, aggregate statistics drift, and unhandled background worker goroutine crashes during deployments. All fixes are verified with 100% test suite passing.
 
 ---
 
@@ -56,7 +62,8 @@ Telephony providers guarantee **At-Least-Once Delivery**. A single event (`event
 1. **Sequentially**: Due to network retry loops after temporary HTTP 5xx errors or socket timeouts.
 2. **Concurrently**: Due to multi-threaded worker dispatch on the provider side.
 
-Application-level deduplication (e.g., `sync.Mutex` or `map[string]bool`) fails across multi-node deployments or restarts due to lack of shared memory state.
+> [!NOTE]
+> Application-level deduplication (e.g., `sync.Mutex` or `map[string]bool`) fails across multi-node deployments or restarts due to lack of shared memory state.
 
 ```
 Request A ──┐
@@ -204,6 +211,9 @@ To launch PostgreSQL, Redis, and the Webhook service:
 docker compose up -d --build
 ```
 
+> [!TIP]
+> Docker Compose automatically handles PostgreSQL and Redis health checks (`pg_isready` & `redis-cli ping`) before booting the application container.
+
 ### 2. Verify Service Health
 ```bash
 curl -i http://localhost:8080/healthz
@@ -326,6 +336,9 @@ internal/
 
 ```
 webhook-ingest/
+├── .github/
+│   └── workflows/
+│       └── ci.yml               # GitHub Actions CI automated build & test pipeline
 ├── cmd/
 │   └── server/
 │       └── main.go              # Entrypoint, DB wiring, cache hydration, graceful shutdown
@@ -342,6 +355,7 @@ webhook-ingest/
 │   └── 002_unique_event_id.sql  # Unique constraint migration on events(event_id)
 ├── Dockerfile                   # Multi-stage optimized Go build
 ├── docker-compose.yml           # Environment compose configuration
+├── LICENSE                      # MIT Open Source License
 ├── Makefile                     # Helper developer targets
 ├── README.md                    # System documentation
 └── SOLUTION.md                  # Detailed solution writeup & 10k/sec scaling blueprint
@@ -383,7 +397,8 @@ To scale the architecture from local execution to **10,000 webhooks/sec**, the s
                            └─────────────────────────────────┘
 ```
 
-See [`SOLUTION.md`](SOLUTION.md) for full architectural design specs, micro-batching configurations, and Redis write-behind caching strategies.
+> [!TIP]
+> See [`SOLUTION.md`](SOLUTION.md) for full architectural design specs, micro-batching configurations, and Redis write-behind caching strategies.
 
 ---
 

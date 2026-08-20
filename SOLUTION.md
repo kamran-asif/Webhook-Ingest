@@ -10,6 +10,11 @@
 
 ---
 
+> [!IMPORTANT]
+> **Executive Summary**: This document details the technical root-cause analysis, mathematical proofs of idempotency, storage engine transaction design, and scaling blueprints for the Telephony Webhook Ingestion Service.
+
+---
+
 ## 📑 Executive Table of Contents
 1. [Executive Summary & Defect Post-Mortem](#1-executive-summary--defect-post-mortem)
 2. [Mathematical & Formal Model of Idempotency](#2-mathematical--formal-model-of-idempotency)
@@ -58,12 +63,8 @@ Let $E_i$ represent a unique webhook delivery payload anchored by idempotency ke
    - State remains invariant: $\Delta_{\text{count}} = 0, \Delta_{\text{dur}} = 0$.
    - Returns: `HTTP 200 OK` (Processed = `false`, Idempotently Acknowledged)
 
-### Failure of Application-Level Locking
-In a multi-replica distributed system behind a Load Balancer, application-tier locking (e.g., `sync.Mutex` or `map[string]bool`) fails because memory state is localized to node $N_j$:
-
-$$\text{Memory}(N_1) \cap \text{Memory}(N_2) = \emptyset$$
-
-Therefore, idempotency MUST be anchored at the centralized, durable storage layer (PostgreSQL).
+> [!WARNING]
+> **Failure of Application-Level Locking**: In a multi-replica distributed system behind a Load Balancer, application-tier locking (e.g., `sync.Mutex` or `map[string]bool`) fails because memory state is localized to node $N_j$: $\text{Memory}(N_1) \cap \text{Memory}(N_2) = \emptyset$. Therefore, idempotency MUST be anchored at the centralized, durable storage layer (PostgreSQL).
 
 ---
 
@@ -147,11 +148,12 @@ ON CONFLICT (account_id) DO UPDATE SET
 COMMIT TRANSACTION;
 ```
 
-### ACID Property Assurance
-- **Atomicity**: If any query step fails, PostgreSQL performs a complete rollback. Partial states (e.g. call created without stats increment) are impossible.
-- **Consistency**: Invariants (`account_stats.call_count == COUNT(DISTINCT calls.call_id)`) are strictly preserved.
-- **Isolation**: Executed under PostgreSQL default `READ COMMITTED` isolation with row-level locks on `account_stats` rows during updates.
-- **Durability**: Committed data is written to Write-Ahead Logging (WAL) disk buffers prior to transaction acknowledgment.
+> [!NOTE]
+> **ACID Guarantees**:
+> - **Atomicity**: Full rollback on failure. Partial writes are impossible.
+> - **Consistency**: Invariants (`call_count == COUNT(DISTINCT calls)`) strictly preserved.
+> - **Isolation**: Executed under `READ COMMITTED` isolation with row-level locks.
+> - **Durability**: Committed transactions written to PostgreSQL Write-Ahead Logging (WAL) disk buffers.
 
 ---
 
@@ -205,18 +207,8 @@ COMMIT TRANSACTION;
                             └──────────────────────────────────┘
 ```
 
-### Key Scaling Pillars:
-1. **Asynchronous Edge Decoupling**:
-   - Ingestion API nodes perform structural validation, push payload bytes directly to Apache Kafka / Redis Streams, and immediately return `202 Accepted` (<5ms latency).
-2. **Partitioning by Tenant (`account_id`)**:
-   - Kafka topics are partitioned by `account_id` to guarantee ordered payload evaluation per account while distributing load evenly across worker threads.
-3. **Micro-Batching (`pgx.Batch` / `COPY` Protocol)**:
-   - Worker consumers aggregate 500 incoming webhooks into a single `pgx.Batch` statement execution.
-   - **Throughput Gain**: Batching 500 records reduces DB transaction overhead from 10,000 individual transactions/sec to just 20 batch transactions/sec, reducing WAL I/O overhead by over 95%.
-4. **PgBouncer Transaction-Level Connection Pooling**:
-   - Multiplexes thousands of client worker connections into a bounded pool (e.g. 50 connections) directly targeting PostgreSQL.
-5. **CQRS Read/Write Separation**:
-   - Reads (`GET /accounts/{id}/stats`) are served from Redis clusters with write-behind or pub-sub cache invalidation, shielding PostgreSQL primary nodes from query load.
+> [!TIP]
+> **Micro-Batching Efficiency**: Aggregating 500 incoming webhooks into a single `pgx.Batch` statement execution reduces database transaction overhead from 10,000 individual transactions/sec to just 20 batch transactions/sec, reducing Write-Ahead Logging (WAL) disk I/O overhead by over 95%.
 
 ---
 
