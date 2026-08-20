@@ -6,7 +6,7 @@
 [![Architecture](https://img.shields.io/badge/Architecture-ACID--Idempotent-brightgreen)](#-architecture--idempotency-design)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A production-grade, highly scalable HTTP webhook ingestion service written in Go. Designed to process high-throughput telephony call-completion events, guarantee **durable exact-once storage**, and maintain zero-drift per-account call analytics under **at-least-once provider delivery**.
+A production-grade, highly scalable HTTP webhook ingestion service written in Go. Designed to process high-throughput telephony call-completion events, guarantee **durable exact-once processing semantics (EOPS)**, and maintain zero-drift per-account call analytics under **at-least-once provider delivery**.
 
 ---
 
@@ -16,6 +16,7 @@ A production-grade, highly scalable HTTP webhook ingestion service written in Go
 - [Architecture & Idempotency Design](#-architecture--idempotency-design)
 - [Database Schema & ER Diagram](#-database-schema--er-diagram)
 - [Sequence Diagrams](#-sequence-diagrams)
+- [📚 System Engineering & Domain Terminology](#-system-engineering--domain-terminology)
 - [Quick Start & Local Setup](#-quick-start--local-setup)
 - [Configuration Reference](#-configuration-reference)
 - [API Reference & Examples](#-api-reference--examples)
@@ -28,34 +29,34 @@ A production-grade, highly scalable HTTP webhook ingestion service written in Go
 
 ## 🔍 Incident & Defect Resolution Summary
 
-| Incident Symptom | Root Cause | Architectural Fix |
+| Incident Symptom | Root Cause Term | Architectural Fix & Terminology |
 | :--- | :--- | :--- |
-| ❌ **Duplicate Call Records** | Missing `UNIQUE` index on `events(event_id)`. Sequential queries allowed duplicate rows. | Created `idx_events_event_id_unique` constraint in PostgreSQL and used `INSERT ... ON CONFLICT (event_id) DO NOTHING`. |
-| ❌ **Account Call-Count Drifting** | `IncrementAccountStats` executed unconditionally on redeliveries and retries. | Wrapped event insert, call record upsert, and account stats update into a single atomic PostgreSQL transaction (`IngestEventTx`). Stats increment **only** if the event is newly inserted. |
-| ❌ **Recordings Not Marked/Processed** | Async recording background tasks had no error monitoring or completion tracking. | Integrated background goroutine error logging and `sync.WaitGroup` to wait for active recording jobs during graceful shutdown. |
-| ❌ **In-Flight Data Disappearing on Deploy** | Server process terminated immediately without waiting for background goroutines to drain. | Implemented `Service.Shutdown(ctx)` with a blocking `WaitGroup` drain and timeout handle in `main.go`. |
-| ❌ **Cache Desynchronization on Restart** | In-memory stats cache started empty on reboot without database hydration. | Implemented `InitCache()` to populate cache directly from `account_stats` table during startup, with PostgreSQL fallback queries on cache miss. |
+| ❌ **Duplicate Call Records** | Missing **B-Tree Unique Constraint** on `events(event_id)`. Non-atomic sequential SELECT-then-INSERT. | Applied **Storage-Tier Uniqueness** (`idx_events_event_id_unique`) and **UPSERT** (`INSERT ... ON CONFLICT DO NOTHING`). |
+| ❌ **Account Call-Count Drifting** | **Unbounded Redelivery Side-Effects** & non-transactional statistic updates. | Encapsulated operations in a single **ACID Transaction** (`IngestEventTx`). Statistics increment **only** if the event is newly inserted. |
+| ❌ **Recordings Not Marked/Processed** | **Unmonitored Asynchronous Goroutines** lacking exception propagation. | Integrated structured error logging (`slog`) and worker synchronization via **Goroutine Lifecycle Tracking**. |
+| ❌ **In-Flight Data Disappearing on Deploy** | **Abrupt Process Termination** without worker drain signal. | Implemented **Graceful Worker Drain** (`Service.Shutdown`) using `sync.WaitGroup` and context timeouts. |
+| ❌ **Cache Desynchronization on Restart** | **Cold-Start Empty State** in volatility memory without storage hydration. | Executed **Cache Hydration / Warming** (`InitCache()`) on boot with **Fallback Lookups** on cache miss. |
 
 ---
 
 ## 🌟 Key Features
 
-- **🛡️ Database-Backed Idempotency**: Single-transaction processing (`IngestEventTx`) using PostgreSQL `ON CONFLICT DO NOTHING` guarantees exact-once execution across process restarts and multi-replica clusters.
-- **⚡ Concurrency Safety**: Safely resolves parallel duplicate webhooks without race conditions or locks at the application tier (eliminates TOCTOU bugs).
-- **🔄 Durable Cache & Fallback**: Thread-safe in-memory cache populated from PostgreSQL at boot, featuring atomic cache sync and database fallback logic.
-- **⚓ Graceful Lifecycle Drain**: WaitGroup worker drain blocks service exit until all in-flight asynchronous operations (e.g. call recording transcodes) complete.
-- **🛡️ Strict Payload Validation**: Rejects malformed JSON payloads and invalid status values (`completed`, `failed`, `no_answer`) immediately with standard HTTP 400 Bad Request.
+- **🛡️ Database-Backed Idempotency**: Single-transaction processing (`IngestEventTx`) using PostgreSQL `ON CONFLICT DO NOTHING` guarantees **Exact-Once Processing Semantics (EOPS)** across horizontal app clusters.
+- **⚡ Concurrency & TOCTOU Prevention**: Resolves parallel duplicate webhooks atomically at the database engine level, eliminating **Time-of-Check to Time-of-Use (TOCTOU)** race conditions.
+- **🔄 Durable Cache & Fallback**: Thread-safe in-memory cache populated from PostgreSQL at boot, featuring **Optimistic Read-Side CQRS** and fallback querying.
+- **⚓ Graceful Lifecycle Drain**: WaitGroup worker drain blocks SIGTERM process shutdown until all in-flight asynchronous operations (e.g. call recording transcodes) complete.
+- **🛡️ Strict Contract Validation**: Enforces RFC-compliant HTTP API contracts, rejecting malformed JSON schemas and illegal statuses with standard **400 Bad Request**.
 
 ---
 
 ## 🏗️ Architecture & Idempotency Design
 
 ### The Core Problem: Provider At-Least-Once Delivery
-Telephony providers guarantee **at-least-once delivery**. A single event (`event_id`) can arrive:
-1. Sequentially (due to network retry loops after temporary HTTP 5xx or socket timeouts).
-2. Concurrently (due to multi-threaded worker dispatch on the provider end).
+Telephony providers guarantee **At-Least-Once Delivery**. A single event (`event_id`) can arrive:
+1. **Sequentially**: Due to network retry loops after temporary HTTP 5xx errors or socket timeouts.
+2. **Concurrently**: Due to multi-threaded worker dispatch on the provider side.
 
-Application-level deduplication (e.g., `sync.Mutex` or `map[string]bool`) fails across multi-node deployments or restarts.
+Application-level deduplication (e.g., `sync.Mutex` or `map[string]bool`) fails across multi-node deployments or restarts due to lack of shared memory state.
 
 ```
 Request A ──┐
@@ -80,12 +81,12 @@ ON CONFLICT (event_id) DO NOTHING;
 
 -- If rows_affected == 0, duplicate detected -> ROLLBACK & EXIT (inserted = false)
 
--- 2. Upsert Call Record
+-- 2. Upsert Call Record (State Sync)
 INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
 VALUES ($1, $2, $3, $4, $5, now())
 ON CONFLICT (call_id) DO UPDATE SET ...;
 
--- 3. Atomically Increment Per-Account Stats
+-- 3. Atomically Increment Per-Account Aggregate Stats
 INSERT INTO account_stats (account_id, call_count, total_duration_sec)
 VALUES ($1, 1, $2)
 ON CONFLICT (account_id) DO UPDATE SET
@@ -103,24 +104,24 @@ COMMIT;
 erDiagram
     events {
         text event_id PK "UNIQUE INDEX idx_events_event_id_unique"
-        text call_id FK
-        text account_id
-        jsonb payload
-        timestamptz received_at
+        text call_id FK "Foreign Key to calls.call_id"
+        text account_id "Partitioning / Tenant Identifier"
+        jsonb payload "Raw Webhook JSON Delivery"
+        timestamptz received_at "Ingestion Timestamp"
     }
     calls {
-        text call_id PK
-        text account_id
-        text status
-        integer duration_sec
-        text recording_url
-        boolean recording_processed
-        timestamptz updated_at
+        text call_id PK "Primary Call Entity Key"
+        text account_id "Tenant Identifier"
+        text status "Call Status (completed|failed|no_answer)"
+        integer duration_sec "Call Duration in Seconds"
+        text recording_url "Media Recording Location"
+        boolean recording_processed "Async Job Status Flag"
+        timestamptz updated_at "State Mutation Timestamp"
     }
     account_stats {
-        text account_id PK
-        bigint call_count
-        bigint total_duration_sec
+        text account_id PK "Tenant Identifier"
+        bigint call_count "Aggregate Completed Call Count"
+        bigint total_duration_sec "Aggregate Total Duration Seconds"
     }
 
     events }|--|| calls : "references call_id"
@@ -142,33 +143,51 @@ sequenceDiagram
     participant Cache as In-Memory Cache
 
     Provider->>Router: POST /webhooks/calls (JSON Payload)
-    Router->>Router: Validate JSON & Event Status
+    Router->>Router: Contract Validation (JSON & Event Status)
     alt Invalid Payload / Status
         Router-->>Provider: HTTP 400 Bad Request
     else Valid Payload
         Router->>Ingest: Ingest(ctx, Event)
         Ingest->>Store: IngestEventTx(ctx, Event)
-        Note over Store: BEGIN TRANSACTION
+        Note over Store: BEGIN TRANSACTION (ACID Boundary)
         Store->>Store: INSERT INTO events ... ON CONFLICT DO NOTHING
-        alt Event Already Exists (Duplicate)
+        alt Event Already Exists (Duplicate Delivery)
             Note over Store: ROLLBACK TRANSACTION
             Store-->>Ingest: inserted = false
             Ingest-->>Router: nil
-            Router-->>Provider: HTTP 200 OK (Ignored Duplicate)
-        else Event Inserted (New)
-            Store->>Store: Upsert Call Record
-            Store->>Store: Increment Account Stats (+1 count, +duration)
+            Router-->>Provider: HTTP 200 OK (Idempotent Ack)
+        else Event Inserted (New Delivery)
+            Store->>Store: Upsert Call Entity State
+            Store->>Store: Increment Account Aggregates (+1 count, +duration)
             Note over Store: COMMIT TRANSACTION
             Store-->>Ingest: inserted = true
             Ingest->>Cache: Record(accountID, durationSec)
             opt Recording URL Present
-                Ingest->>Ingest: Spawn Background Worker (wg.Add)
+                Ingest->>Ingest: Spawn Worker Goroutine (wg.Add)
             end
             Ingest-->>Router: nil
             Router-->>Provider: HTTP 200 OK
         end
     end
 ```
+
+---
+
+## 📚 System Engineering & Domain Terminology
+
+| Technical Term | Definition & Context in System |
+| :--- | :--- |
+| **At-Least-Once Delivery** | Provider delivery semantic where webhooks are retried until an HTTP 2xx acknowledgement is received, potentially delivering duplicate events. |
+| **Exact-Once Processing Semantics (EOPS)** | Guarantee that regardless of duplicate deliveries, state mutations (database inserts & aggregate stats increments) execute exactly once. |
+| **Idempotency Key (`event_id`)** | Unique payload identifier used by the service to recognize and discard duplicate deliveries safely. |
+| **Time-of-Check to Time-of-Use (TOCTOU)** | Concurrency bug where checking state (`SELECT EXISTS`) and updating state (`INSERT`) are separate operations, causing race conditions. Solved via atomic SQL transactions. |
+| **ACID Transaction Boundary** | Database isolation (`BEGIN ... COMMIT`) wrapping event insertion, call upsert, and stats updates to guarantee atomicity and rollbacks on failure. |
+| **UPSERT (`ON CONFLICT DO NOTHING`)** | Atomic database primitive combining insertion and collision detection in a single query execution step. |
+| **CQRS (Command Query Responsibility Segregation)** | Separation of high-throughput write paths (PostgreSQL transaction) and low-latency read paths (In-memory stats cache lookups). |
+| **Cache Hydration / Warming** | Bootstrapping the in-memory cache from PostgreSQL on server startup (`InitCache()`) to eliminate cold-start cache misses. |
+| **Graceful Worker Drain** | Orderly process shutdown mechanism (`sync.WaitGroup`) waiting for active asynchronous goroutines to complete before SIGTERM process termination. |
+| **Micro-Batching** | Optimization technique aggregating thousands of stream events into multi-row SQL transactions (`pgx.Batch` / `COPY`) to minimize Write-Ahead Logging (WAL) I/O overhead. |
+| **Transaction-Level Pooling (PgBouncer)** | Database proxy mechanism multiplexing thousands of short-lived client connections over a bounded pool of persistent PostgreSQL connections. |
 
 ---
 
