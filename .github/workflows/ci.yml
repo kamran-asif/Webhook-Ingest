@@ -21,7 +21,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U webhook -d webhook"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -49,16 +49,16 @@ jobs:
       - name: Apply Database Migrations
         run: |
           sudo apt-get update && sudo apt-get install -y postgresql-client
-          PGPASSWORD=webhook psql -h localhost -U webhook -d webhook -f migrations/001_init.sql
-          PGPASSWORD=webhook psql -h localhost -U webhook -d webhook -f migrations/002_unique_event_id.sql
+          PGPASSWORD=webhook psql -h 127.0.0.1 -U webhook -d webhook -f migrations/001_init.sql
+          PGPASSWORD=webhook psql -h 127.0.0.1 -U webhook -d webhook -f migrations/002_unique_event_id.sql
 
       - name: Compile Packages
         run: go build ./...
 
       - name: Run Integration & Unit Test Suite
         env:
-          DATABASE_URL: "postgres://webhook:webhook@localhost:5432/webhook?sslmode=disable"
-          REDIS_ADDR: "localhost:6379"
+          DATABASE_URL: "postgres://webhook:webhook@127.0.0.1:5432/webhook?sslmode=disable"
+          REDIS_ADDR: "127.0.0.1:6379"
         run: go test -v -race -coverprofile=coverage.out ./...
 
       - name: Upload Test Coverage
