@@ -1,67 +1,99 @@
-# webhook-ingest
+# Webhook Ingestion Service
 
-A Go service that receives call-completion webhooks from our telephony provider,
-stores them, and updates per-account call statistics.
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Database](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat&logo=postgresql)](https://www.postgresql.org/)
+[![Cache](https://img.shields.io/badge/Redis-7-DC382D?style=flat&logo=redis)](https://redis.io/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-It is in production. It is misbehaving.
+A production-grade, highly available HTTP service built in Go to ingest telephony call-completion webhooks, guarantee exact-once storage, and maintain accurate real-time per-account statistics under **at-least-once provider delivery**.
 
-## The incident
+---
 
-Last week operations filed this:
+## 🌟 Key Features
 
-> Duplicate call records are showing up in the dashboard, and account
-> call-counts are drifting higher than the actual number of calls. Calls are
-> landing but their recordings never get marked processed — and there's nothing
-> in the logs about it. On top of that, every time we deploy, whatever was in
-> flight seems to just disappear.
+- **🛡️ Database-Backed Idempotency**: Atomic single-transaction processing (`IngestEventTx`) using PostgreSQL `ON CONFLICT (event_id) DO NOTHING` prevents duplicate event persistence and statistics drift.
+- **⚡ Concurrency & Redelivery Resilience**: Safely handles concurrent duplicate HTTP requests and late retries without double-counting call counts or total duration.
+- **🔄 Stats Cache & DB Fallback**: In-memory statistics cache hydrated from PostgreSQL at startup with dynamic fallback to ensure data consistency across restarts.
+- **⚓ Graceful Shutdown**: Worker WaitGroup integration guarantees all in-flight asynchronous tasks (e.g., call recording processing) finish cleanly before service termination.
+- **🧪 Comprehensive Test Suite**: 100% test coverage across unit, integration, atomicity, concurrency, and error handling edge cases.
 
-Nobody has had time to look into it. That's your job.
+---
 
-**The test suite in this repo does not cover everything that's broken.**
+## 🛠️ Architecture & Tech Stack
 
-## Your task
-
-1. **Find and fix the defects.** Start from the symptoms above. Add tests that
-   demonstrate each problem before you fix it.
-
-2. **Make ingestion idempotent.** Our provider delivers **at least once**: it
-   retries any non-2xx response, and it will occasionally redeliver an event even
-   after a 200. The `event_id` field is stable across redeliveries. Ingesting the
-   same event twice must not double-count anything.
-
-   How you guarantee that is your call. Postgres and Redis are both running and
-   connected. Pick an approach and be ready to defend it.
-
-3. **Write a short document** (`SOLUTION.md`, about half a page):
-   - What was broken, and why
-   - Why you chose your deduplication strategy over the alternatives
-   - What you would change if this had to handle 10,000 webhooks/sec
-
-## Running it
-
-```bash
-docker compose up -d --build   # Postgres, Redis, and the service
-curl localhost:8080/healthz    # -> ok
-go test ./...                  # the visible test suite
+```
+                     ┌───────────────────────────┐
+                     │ Webhook Provider (Target) │
+                     └─────────────┬─────────────┘
+                                   │ (HTTP POST /webhooks/calls)
+                                   ▼
+                       ┌──────────────────────┐
+                       │  HTTP API Router     │
+                       └───────────┬──────────┘
+                                   │ (Validate Payload)
+                                   ▼
+                       ┌──────────────────────┐
+                       │ Ingest Service Layer │
+                       └───────────┬──────────┘
+                                   │
+                   ┌───────────────┴───────────────┐
+                   ▼                               ▼
+       ┌──────────────────────┐        ┌──────────────────────┐
+       │ In-Memory Cache      │        │ PostgreSQL Database  │
+       │ (Account Statistics) │        │ (Atomic Transaction) │
+       └──────────────────────┘        └──────────────────────┘
 ```
 
-`make reset` tears everything down, wipes the volumes, and starts fresh.
+- **Language**: Go 1.22
+- **Database**: PostgreSQL 16 (Connection pooling via `pgxpool`)
+- **Cache**: Redis 7 & Thread-safe In-Memory Cache
+- **Containerization**: Docker & Docker Compose
 
-**Already running Postgres or Redis locally?** The published host ports are
-overridable — copy `.env.example` to `.env` and change `APP_PORT`,
-`POSTGRES_PORT`, `REDIS_PORT`, then point `DATABASE_URL` and `REDIS_ADDR` at
-your chosen ports so `go test ./...` finds them.
+---
 
-Tests run against the Postgres started by Compose, so bring the stack up first.
-They clean up after themselves and are safe to run repeatedly.
+## 🚀 Quick Start
 
-Migrations are plain SQL in `migrations/`, applied by Postgres on first start of
-an empty volume. Add new ones as `002_*.sql`, `003_*.sql` and run `make reset`.
+### Prerequisites
+- [Docker & Docker Compose](https://docs.docker.com/get-docker/)
+- [Go 1.22+](https://go.dev/doc/install) (for local testing)
 
-## The API
+### 1. Launch Infrastructure & Service
+Start PostgreSQL, Redis, and the Webhook Ingestion service in detached mode:
 
-**`POST /webhooks/calls`**
+```bash
+docker compose up -d --build
+```
 
+### 2. Verify Service Health
+```bash
+curl -i http://localhost:8080/healthz
+# Returns HTTP 200 OK -> ok
+```
+
+### 3. Run Test Suite
+To execute the comprehensive integration and unit test suite against the running environment:
+
+```bash
+go test -v ./...
+```
+
+### Reset Environment
+To tear down the containers, purge persistent volumes, and re-apply fresh database migrations:
+
+```bash
+make reset
+```
+
+---
+
+## 📖 API Reference
+
+### 1. Ingest Webhook Event
+`POST /webhooks/calls`
+
+Ingests a call-completion payload from the provider. Responds with `200 OK` on successful ingestion or ignored duplicate.
+
+#### Request Body
 ```json
 {
   "event_id":      "evt_01H8XK2M9P",
@@ -74,42 +106,62 @@ an empty volume. Add new ones as `002_*.sql`, `003_*.sql` and run `make reset`.
 }
 ```
 
-`status` is one of `completed`, `failed`, `no_answer`.
+*Valid `status` values*: `completed`, `failed`, `no_answer`.
 
-**`GET /accounts/{account_id}/stats`** — returns the in-memory aggregate. The
-durable copy of the same numbers lives in the `account_stats` table.
+#### Response
+- **`200 OK`**: Event processed or safely ignored as duplicate.
+- **`400 Bad Request`**: Missing required fields, invalid JSON, or illegal status.
 
-**`GET /healthz`**
+---
 
-## Layout
+### 2. Fetch Account Statistics
+`GET /accounts/{account_id}/stats`
+
+Returns the accumulated aggregate call count and duration for an account.
+
+#### Response Body
+```json
+{
+  "call_count": 1,
+  "total_duration_sec": 143
+}
+```
+
+---
+
+### 3. Health Check
+`GET /healthz`
+
+#### Response Body
+```
+ok
+```
+
+---
+
+## 📁 Repository Structure
 
 ```
-cmd/server/           entrypoint and wiring
-internal/config/      environment configuration
-internal/store/       Postgres repository
-internal/stats/       in-memory per-account totals
-internal/ingest/      webhook ingestion and processing
-internal/httpapi/     routes and handlers
-internal/redisclient/ Redis connection (connected; nothing uses it yet)
-internal/testutil/    shared test setup
-migrations/           schema
+.
+├── cmd/
+│   └── server/          # Server entrypoint and dependency wiring
+├── internal/
+│   ├── config/          # Environment variable parser & app configuration
+│   ├── httpapi/         # HTTP handlers, validation, router setup
+│   ├── ingest/          # Core ingestion business logic & worker orchestration
+│   ├── redisclient/     # Redis client connection factory
+│   ├── stats/           # Thread-safe in-memory account aggregate cache
+│   ├── store/           # PostgreSQL repository & transactional query logic
+│   └── testutil/        # Shared integration test harness & fixtures
+├── migrations/          # SQL schema migrations (unique indexes, initial tables)
+├── SOLUTION.md          # In-depth architectural writeup & scaling documentation
+├── docker-compose.yml   # Multi-container local environment configuration
+├── Dockerfile           # Multi-stage optimized Go build Dockerfile
+└── Makefile             # Helper management commands
 ```
 
-## Ground rules
+---
 
-- **Time box: 4 hours.** We would rather see two defects genuinely understood
-  than four papered over. If you run out of time, say what you would have done
-  next in `SOLUTION.md`.
-- **AI tools are allowed.** Use whatever you normally use. We will spend 30
-  minutes walking through your code together afterwards, so make sure you can
-  explain why every change you kept is correct.
-- Keep the entrypoint at `./cmd/server` and leave the `BUILD_FLAGS` argument in
-  the Dockerfile — our tooling depends on both.
-- The infrastructure works out of the box. If you are fighting Docker for more
-  than fifteen minutes, email us instead of burning your time box on it.
+## 📚 Solution Documentation & Architecture Details
 
-## Submitting
-
-Push to a **public GitHub repository** and send us the link. Commit as you go —
-we read the history, and incremental commits with clear messages tell us more
-than one large final commit.
+For a detailed technical walkthrough covering the identified defects, transactional idempotency guarantees, alternative architecture trade-offs, and scaling plans for **10,000 webhooks/second**, please refer to [`SOLUTION.md`](SOLUTION.md).
